@@ -9,7 +9,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "libmjolnir": "latest",
+    "libmjolnir": "file:..",
+    "lz4js": "^0.2.0",
     "vue": "^3.2.47"
   },
   "devDependencies": {
