@@ -66,6 +66,7 @@ export function OdinFlashTool() {
   const [reboot, setReboot] = useState(true);
   const [checkMd5, setCheckMd5] = useState(true);
   const [skipUserdata, setSkipUserdata] = useState(true);
+  const [writePit, setWritePit] = useState(true);
   const [busy, setBusy] = useState(false);
   const [progressLabel, setProgressLabel] = useState('');
   const [progress, setProgress] = useState<number>(0);
@@ -196,34 +197,52 @@ export function OdinFlashTool() {
     }
   }, [log]);
 
-  // Lee la tabla de particiones del equipo — solo lectura, sin tocar nada.
-  const readPitOnly = useCallback(async () => {
-    setBusy(true); setPit(null);
+  // Conecta, ejecuta una acción sobre el equipo y siempre cierra el puerto.
+  const runOnDevice = useCallback(async (label: string, action: (device: OdinDevice) => Promise<void>) => {
+    setBusy(true);
     let device: OdinDevice | null = null;
     try {
       device = await connectDevice();
       if (!device) return;
-      const pitData = await device.getPitData();
-      setPit(pitData.entries.filter((e) => e.isFlashable));
-      await device.endSession();
+      await action(device);
     } catch (e) {
-      log(`❌ Error leyendo PIT: ${e instanceof Error ? e.message : String(e)}`, 'error');
+      log(`❌ Error ${label}: ${e instanceof Error ? e.message : String(e)}`, 'error');
     } finally {
       await device?.close().catch(() => {});
       setBusy(false);
     }
   }, [connectDevice, log]);
 
-  // Borra userdata (factory reset) — función estándar del protocolo Odin,
-  // ya la tenía el equipo antes de este port. Pide confirmación porque borra
-  // TODOS los datos del usuario (no toca FRP ni ninguna cuenta).
-  const eraseUserdata = useCallback(async () => {
+  // Lee la tabla de particiones del equipo — solo lectura, sin tocar nada.
+  const readPitOnly = useCallback(() => runOnDevice('leyendo PIT', async (device) => {
+    setPit(null);
+    const pitData = await device.getPitData();
+    setPit(pitData.entries.filter((e) => e.isFlashable));
+    await device.endSession();
+  }), [runOnDevice]);
+
+  // Igual que leer el PIT, pero además lo descarga como archivo .pit.
+  const savePit = useCallback(() => runOnDevice('guardando PIT', async (device) => {
+    const pitData = await device.getPitData();
+    setPit(pitData.entries.filter((e) => e.isFlashable));
+    await device.endSession();
+    const raw = device.pitRaw;
+    if (!raw) return;
+    const url = URL.createObjectURL(new Blob([raw as Uint8Array<ArrayBuffer>], { type: 'application/octet-stream' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `equipo_${new Date().toISOString().slice(0, 10)}.pit`;
+    a.click();
+    URL.revokeObjectURL(url);
+    log(`💾 PIT guardado (${raw.length} bytes)`, 'ok');
+  }), [runOnDevice, log]);
+
+  // Borra userdata (factory reset) — función estándar del protocolo Odin.
+  // Pide confirmación porque borra TODOS los datos del usuario (no toca FRP
+  // ni ninguna cuenta).
+  const eraseUserdata = useCallback(() => {
     if (!window.confirm('Esto borra TODOS los datos del usuario (factory reset). ¿Continuar?')) return;
-    setBusy(true);
-    let device: OdinDevice | null = null;
-    try {
-      device = await connectDevice();
-      if (!device) return;
+    return runOnDevice('borrando userdata', async (device) => {
       log('🗑️ Borrando userdata (factory reset)...', 'warn');
       await device.eraseUserdata();
       log('✅ Userdata borrado', 'ok');
@@ -231,13 +250,25 @@ export function OdinFlashTool() {
       setTimeout(() => setEraseToast(false), 4000);
       log('🔄 Reiniciando a modo normal...', 'info');
       await device.endSession(true);
-    } catch (e) {
-      log(`❌ Error borrando userdata: ${e instanceof Error ? e.message : String(e)}`, 'error');
-    } finally {
-      await device?.close().catch(() => {});
-      setBusy(false);
-    }
-  }, [connectDevice, log]);
+    });
+  }, [runOnDevice, log]);
+
+  // Saca el equipo del modo Download y lo arranca normal.
+  const rebootDevice = useCallback(() => runOnDevice('reiniciando', async (device) => {
+    await device.reboot();
+    log('✅ Equipo reiniciado', 'ok');
+  }), [runOnDevice, log]);
+
+  // Solo handshake + sesión: confirma que el puerto y el equipo responden.
+  const testConnection = useCallback(() => runOnDevice('probando conexión', async (device) => {
+    log('✅ El equipo responde en modo Download', 'ok');
+    await device.endSession();
+  }), [runOnDevice, log]);
+
+  const copyLog = useCallback(async () => {
+    await navigator.clipboard.writeText(logs.map((l) => `${l.t} ${l.text}`).join('\n'));
+    log('📋 Consola copiada al portapapeles', 'ok');
+  }, [logs, log]);
 
   const flash = useCallback(async () => {
     const activeFiles: Partial<Record<OdinSlot, File>> = {};
@@ -356,7 +387,8 @@ export function OdinFlashTool() {
       await device.setFlashTotalSize(totalBytes);
       log(`📐 Total a escribir: ${(totalBytes / 1048576).toFixed(1)} MB`, 'info');
 
-      if (pitFile) await device.flashPit(pitFile);
+      if (pitFile && writePit) await device.flashPit(pitFile);
+      else if (pitFile) log('⏭️ PIT del firmware NO escrito (opción "Escribir PIT" desactivada)', 'warn');
 
       const pitData: PitData = await device.getPitData();
 
@@ -410,18 +442,9 @@ export function OdinFlashTool() {
       });
       setHistory(next);
       setProgressLabel('¡Listo!');
+      setProgress(1);
       log('✅✅ FLASHEO COMPLETADO ✅✅', 'ok');
-      if (reboot) {
-        log('▶️ Reiniciando... El equipo debería arrancar el sistema normalmente.', 'info');
-        log('   Si vuelve a MODES DESCARGABLES (recovery/descarga) en vez de encender,', 'warn');
-        log('   se escribió firmware inválido — NO reintentar flashear más veces el mismo set.', 'error');
-        // Recordatorio visible que no se puede perder en el scroll de la consola.
-        window.setTimeout(() => {
-          window.alert(
-            '✅ Flasheo terminado.\n\nSi el equipo NO enciende y vuelve a modo descarga/recovery, el firmware escrito es inválido.\nNo reintentes el mismo set: re-descarga el firmware exacto del modelo antes de volver a flashear.',
-          );
-        }, 1500);
-      }
+      if (reboot) log('▶️ Reiniciando el equipo...', 'info');
     } catch (e) {
       log(`❌ Error: ${e instanceof Error ? e.message : String(e)}`, 'error');
       setProgressLabel('Error');
@@ -430,139 +453,246 @@ export function OdinFlashTool() {
       await device?.close().catch(() => {});
       setBusy(false);
     }
-  }, [slots, reboot, checkMd5, skipUserdata, connectDevice, log]);
+  }, [slots, reboot, checkMd5, skipUserdata, writePit, connectDevice, log]);
+
+  const loaded = ODIN_SLOTS.filter((s) => slots[s].enabled && slots[s].file).length;
 
   return (
     <>
       {eraseToast && (
         <div className="fixed inset-x-0 top-20 z-50 flex justify-center px-4">
-          <div className="animate-bounce rounded-2xl border border-emerald-400/50 bg-emerald-500 px-6 py-3 text-[15px] font-black text-black shadow-[0_0_30px_rgba(52,211,153,0.6)]">
+          <div className="animate-bounce rounded-2xl border border-emerald-400/50 bg-emerald-500 px-6 py-3 text-base font-black text-black shadow-[0_0_30px_rgba(52,211,153,0.6)]">
             ✅ ¡Borrado listo!
           </div>
         </div>
       )}
-      <div className="rounded-2xl border border-zinc-800 bg-black p-4">
+
       {!supported && (
-        <p className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[12px] text-amber-300">
+        <p className="mb-4 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-5 py-4 text-sm text-amber-300">
           Tu navegador no soporta la API de archivos locales (File System Access) ni Web Serial.
           Usa Chrome o Edge de escritorio.
         </p>
       )}
-      {/* ── Historial + carpeta ── */}
-      <div className="mb-3 flex flex-wrap items-center gap-2">
-        <select
-          value={selectedHistory}
-          onChange={(e) => applyHistoryEntry(e.target.value)}
-          className="min-w-[220px] flex-1 rounded-lg border border-[var(--color-border)] bg-black/20 px-2.5 py-1.5 text-[12px] text-zinc-200"
-        >
-          <option value="">{history.length ? `${history.length} versión(es) en el historial` : 'Sin historial todavía'}</option>
-          {history.map((h) => (
-            <option key={h.id} value={h.id}>{new Date(h.ts).toLocaleString('es')} — {h.label.slice(0, 60)}</option>
-          ))}
-        </select>
-        <button type="button" onClick={chooseFolder}
-          className="rounded-lg border border-zinc-700/30 px-3 py-1.5 text-[12px] font-bold text-zinc-300 hover:border-orange-400/60 hover:text-white">
-          📁 {folderName ?? 'Preconfigurar carpeta'}
-        </button>
-        <button type="button" onClick={readPitOnly} disabled={busy}
-          className="rounded-lg border border-sky-500/40 px-3 py-1.5 text-[12px] font-bold text-sky-300 hover:bg-sky-500/10 disabled:opacity-40">
-          📊 Leer PIT (solo lectura)
-        </button>
-        <button type="button" onClick={eraseUserdata} disabled={busy}
-          className="rounded-lg border border-red-500/40 px-3 py-1.5 text-[12px] font-bold text-red-300 hover:bg-red-500/10 disabled:opacity-40">
-          🗑️ Erase Userdata
-        </button>
+
+      <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_340px]">
+        {/* ── Columna principal: firmware + opciones + flash ── */}
+        <div className="space-y-5">
+          <section className={CARD}>
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <h2 className="text-lg font-black text-white">📦 Firmware</h2>
+              <span className="rounded-full bg-orange-500/15 px-3 py-1 text-xs font-bold text-orange-300">
+                {loaded} archivo(s) listo(s)
+              </span>
+            </div>
+
+            <div className="mb-4 grid gap-3 sm:grid-cols-[auto_minmax(0,1fr)]">
+              <button type="button" onClick={chooseFolder} disabled={busy} className={BTN_GHOST}>
+                📁 <span className="max-w-[220px] truncate">{folderName ?? 'Elegir carpeta del firmware'}</span>
+              </button>
+              <select
+                value={selectedHistory}
+                onChange={(e) => applyHistoryEntry(e.target.value)}
+                className="h-12 w-full rounded-xl border border-zinc-800 bg-zinc-900/80 px-4 text-sm text-zinc-200 outline-none focus:border-orange-500/60"
+              >
+                <option value="">{history.length ? `🕘 ${history.length} versión(es) en el historial` : '🕘 Sin historial todavía'}</option>
+                {history.map((h) => (
+                  <option key={h.id} value={h.id}>{new Date(h.ts).toLocaleString('es')} — {h.label.slice(0, 60)}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="space-y-2.5">
+              {ODIN_SLOTS.map((slot) => {
+                const s = slots[slot];
+                return (
+                  <div key={slot}
+                    className={`flex items-center gap-3 rounded-xl border px-3 py-3 transition-colors ${s.enabled && s.file ? 'border-orange-500/30 bg-orange-500/[0.04]' : 'border-zinc-800 bg-zinc-900/40'}`}>
+                    <Switch checked={s.enabled} onChange={() => toggleSlot(slot)} disabled={busy} />
+                    <span className={`w-16 shrink-0 rounded-lg py-1.5 text-center text-sm font-black ${SLOT_COLOR[slot]}`}>{SLOT_LABEL[slot]}</span>
+                    <div className="min-w-0 flex-1">
+                      <p className={`truncate text-sm ${s.file ? 'text-zinc-100' : 'text-zinc-600'}`}>{s.file?.name ?? 'Sin archivo'}</p>
+                      {s.file && <p className="text-xs text-zinc-500">{(s.file.size / 1048576).toFixed(1)} MB</p>}
+                    </div>
+                    <button type="button" onClick={() => openSlotFile(slot)} disabled={busy}
+                      className="h-10 shrink-0 rounded-lg border border-zinc-700 px-4 text-sm font-bold text-zinc-300 transition hover:border-orange-400/60 hover:text-white disabled:opacity-40">
+                      Abrir
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+
+          <section className={CARD}>
+            <h2 className="mb-4 text-lg font-black text-white">⚙️ Opciones</h2>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Option checked={reboot} onChange={() => setReboot((v) => !v)} disabled={busy}
+                title="Reiniciar al terminar" hint="Arranca el sistema al final del flasheo" />
+              <Option checked={checkMd5} onChange={() => setCheckMd5((v) => !v)} disabled={busy}
+                title="Verificar MD5" hint="Comprueba los .tar.md5 antes de escribir" />
+              <Option checked={writePit} onChange={() => setWritePit((v) => !v)} disabled={busy}
+                title="Escribir PIT del CSC" hint="Como odin4: reparticiona con el .pit del firmware" />
+              <Option checked={skipUserdata} onChange={() => setSkipUserdata((v) => !v)} disabled={busy}
+                title="Omitir userdata" hint="No escribe userdata.img (se formatea sola)" />
+            </div>
+
+            <div className="mt-5 flex gap-3">
+              <button type="button" onClick={flash} disabled={busy}
+                className="h-14 flex-1 rounded-xl bg-gradient-to-r from-orange-500 to-amber-400 text-lg font-black tracking-wide text-black shadow-[0_8px_30px_rgba(249,115,22,0.35)] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none">
+                ⚡ FLASH
+              </button>
+              <button type="button" onClick={resetAll} disabled={busy} className={`${BTN_GHOST} h-14 px-6`}>
+                Limpiar
+              </button>
+            </div>
+
+            {progressLabel && (
+              <div className="mt-5 rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
+                <div className="flex items-center justify-between gap-3 text-sm">
+                  <span className="truncate font-semibold text-zinc-200">{busy ? '⏳' : progress >= 1 ? '✅' : '•'} {progressLabel}</span>
+                  <span className="font-mono text-base font-bold text-orange-300">{Math.round(progress * 100)}%</span>
+                </div>
+                <div className="mt-3 h-3 w-full overflow-hidden rounded-full bg-black/60">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-orange-500 to-amber-400 transition-[width] duration-200"
+                    style={{ width: `${Math.max(2, Math.round(progress * 100))}%` }}
+                  />
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+
+        {/* ── Columna lateral: acciones sobre el equipo ── */}
+        <aside className="space-y-5">
+          <section className={CARD}>
+            <h2 className="mb-1 text-lg font-black text-white">📱 Equipo</h2>
+            <p className="mb-4 text-xs text-zinc-500">El teléfono debe estar en modo Download.</p>
+
+            <p className="mb-2 text-[11px] font-bold uppercase tracking-wider text-zinc-500">Información</p>
+            <div className="grid gap-2.5">
+              <ActionButton onClick={testConnection} disabled={busy} icon="🔌" title="Probar conexión" hint="Handshake ODIN/LOKE" tone="sky" />
+              <ActionButton onClick={readPitOnly} disabled={busy} icon="📊" title="Leer PIT" hint="Tabla de particiones, solo lectura" tone="sky" />
+              <ActionButton onClick={savePit} disabled={busy} icon="💾" title="Guardar PIT" hint="Descarga el .pit del equipo" tone="sky" />
+            </div>
+
+            <p className="mb-2 mt-5 text-[11px] font-bold uppercase tracking-wider text-zinc-500">Acciones</p>
+            <div className="grid gap-2.5">
+              <ActionButton onClick={rebootDevice} disabled={busy} icon="🔄" title="Reiniciar equipo" hint="Sale del modo Download" tone="emerald" />
+              <ActionButton onClick={eraseUserdata} disabled={busy} icon="🗑️" title="Erase Userdata" hint="Factory reset — borra los datos" tone="red" />
+            </div>
+          </section>
+        </aside>
       </div>
 
       {pit && (
-        <div className="mb-3 max-h-[180px] overflow-y-auto rounded-lg border border-sky-500/30 bg-black/20 text-[11px]">
-          <table className="w-full">
-            <thead className="sticky top-0 bg-black/60 text-zinc-500">
-              <tr>
-                <th className="px-2 py-1 text-left">Partición</th>
-                <th className="px-2 py-1 text-left">flashFilename</th>
-                <th className="px-2 py-1 text-left">id</th>
-                <th className="px-2 py-1 text-left">binaryType</th>
-                <th className="px-2 py-1 text-left">deviceType</th>
-              </tr>
-            </thead>
-            <tbody>
-              {pit.map((p, i) => (
-                <tr key={i} className="border-t border-white/5 text-zinc-300">
-                  <td className="px-2 py-1">{p.partitionName}</td>
-                  <td className="px-2 py-1">{p.flashFilename || '—'}</td>
-                  <td className="px-2 py-1">{p.identifier}</td>
-                  <td className="px-2 py-1">{p.binaryType === 1 ? 'CP (modem)' : 'AP (phone)'}</td>
-                  <td className="px-2 py-1">{p.deviceType}</td>
+        <section className={`${CARD} mt-5`}>
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="text-lg font-black text-white">📊 PIT del equipo <span className="text-sm font-semibold text-zinc-500">({pit.length} particiones)</span></h2>
+            <button type="button" onClick={() => setPit(null)} className="text-sm font-bold text-zinc-500 hover:text-white">✕ Cerrar</button>
+          </div>
+          <div className="max-h-[320px] overflow-y-auto rounded-xl border border-zinc-800">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 bg-zinc-900 text-xs uppercase tracking-wider text-zinc-500">
+                <tr>
+                  <th className="px-4 py-2.5 text-left">Partición</th>
+                  <th className="px-4 py-2.5 text-left">Archivo</th>
+                  <th className="px-4 py-2.5 text-left">ID</th>
+                  <th className="px-4 py-2.5 text-left">Tipo</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {/* ── Slots BL/AP/CP/CSC/DATA ── */}
-      <div className="space-y-1.5">
-        {ODIN_SLOTS.map((slot) => (
-          <div key={slot} className="flex items-center gap-2 rounded-lg border border-[var(--color-border)] bg-black/10 px-2.5 py-1.5">
-            <input type="checkbox" checked={slots[slot].enabled} onChange={() => toggleSlot(slot)} />
-            <span className="w-10 shrink-0 text-[12px] font-black text-zinc-400">{SLOT_LABEL[slot]}</span>
-            <span className="flex-1 truncate rounded border border-[var(--color-border)] bg-black/20 px-2 py-1 text-[11px] text-zinc-300">
-              {slots[slot].file?.name ?? '—'}
-            </span>
-            <button type="button" onClick={() => openSlotFile(slot)} disabled={busy}
-              className="shrink-0 rounded-lg border border-zinc-700/30 px-2.5 py-1 text-[11px] font-bold text-zinc-300 hover:border-orange-400/60 hover:text-white disabled:opacity-40">
-              Open
-            </button>
+              </thead>
+              <tbody>
+                {pit.map((p, i) => (
+                  <tr key={i} className="border-t border-zinc-800/80 text-zinc-300 hover:bg-white/[0.03]">
+                    <td className="px-4 py-2 font-semibold text-zinc-100">{p.partitionName}</td>
+                    <td className="px-4 py-2 font-mono text-xs">{p.flashFilename || '—'}</td>
+                    <td className="px-4 py-2 font-mono text-xs">{p.identifier}</td>
+                    <td className="px-4 py-2 text-xs">{p.binaryType === 1 ? 'CP (modem)' : 'AP'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
-        ))}
-      </div>
-
-      {/* ── Opciones ── */}
-      <div className="mt-3 flex flex-wrap items-center gap-4 text-[12px] text-zinc-300">
-        <label className="flex items-center gap-1.5"><input type="checkbox" checked={reboot} onChange={() => setReboot((v) => !v)} /> Reboot</label>
-        <label className="flex items-center gap-1.5"><input type="checkbox" checked={checkMd5} onChange={() => setCheckMd5((v) => !v)} /> Check MD5</label>
-        <label className="flex items-center gap-1.5"><input type="checkbox" checked={skipUserdata} onChange={() => setSkipUserdata((v) => !v)} /> Omitir userdata</label>
-
-        <div className="ml-auto flex gap-2">
-          <button type="button" onClick={flash} disabled={busy}
-            className="rounded-lg bg-orange-500 px-4 py-1.5 text-[12px] font-black text-black hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-40">
-            ⚡ FLASH
-          </button>
-          <button type="button" onClick={resetAll} disabled={busy}
-            className="rounded-lg border border-zinc-700/30 px-4 py-1.5 text-[12px] font-bold text-zinc-300 hover:text-white disabled:opacity-40">
-            Clear
-          </button>
-        </div>
-      </div>
-
-      {/* ── Progreso ── */}
-      {(busy && progressLabel) && (
-        <div className="mt-3">
-          <div className="flex items-center justify-between text-[13px]">
-            <span className="font-semibold text-zinc-200">⏳ {progressLabel}</span>
-            <span className="font-mono text-zinc-300">{Math.round(progress * 100)}%</span>
-          </div>
-          <div className="mt-1.5 h-3 w-full overflow-hidden rounded-full border border-zinc-700 bg-black/40">
-            <div
-              className="h-full rounded-full bg-gradient-to-r from-orange-500 to-amber-400 transition-[width] duration-200"
-              style={{ width: `${Math.max(2, Math.round(progress * 100))}%` }}
-            />
-          </div>
-        </div>
+        </section>
       )}
 
       {/* ── Consola ── */}
-      <div className="mt-3 flex min-h-[220px] flex-col overflow-hidden rounded-xl border border-[var(--color-border)]">
-        <div ref={consoleRef} className="max-h-[300px] flex-1 overflow-y-auto bg-black px-3 py-3 font-mono text-sm leading-relaxed">
+      <section className="mt-5 overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-950">
+        <div className="flex items-center justify-between border-b border-zinc-800 bg-zinc-900/70 px-4 py-2.5">
+          <div className="flex items-center gap-2">
+            <span className="h-3 w-3 rounded-full bg-red-500/80" />
+            <span className="h-3 w-3 rounded-full bg-amber-400/80" />
+            <span className="h-3 w-3 rounded-full bg-emerald-500/80" />
+            <span className="ml-2 text-sm font-bold text-zinc-400">Consola</span>
+          </div>
+          <div className="flex gap-2">
+            <button type="button" onClick={copyLog} className="rounded-lg px-3 py-1 text-xs font-bold text-zinc-400 hover:bg-white/5 hover:text-white">📋 Copiar</button>
+            <button type="button" onClick={clear} disabled={busy} className="rounded-lg px-3 py-1 text-xs font-bold text-zinc-400 hover:bg-white/5 hover:text-white disabled:opacity-40">🧹 Limpiar</button>
+          </div>
+        </div>
+        <div ref={consoleRef} className="h-[380px] overflow-y-auto px-4 py-3 font-mono text-sm leading-relaxed">
           {logs.map((l, i) => (
             <p key={i} className={`break-all ${LOG_COLOR[l.kind]}`}>
-              <span className="mr-1.5 text-zinc-600">{l.t}</span>{l.text}
+              <span className="mr-2 text-zinc-600">{l.t}</span>{l.text}
             </p>
           ))}
         </div>
-      </div>
-      </div>
+      </section>
     </>
+  );
+}
+
+const CARD = 'rounded-2xl border border-zinc-800 bg-gradient-to-b from-zinc-900/80 to-zinc-950 p-5 shadow-xl shadow-black/40';
+const BTN_GHOST = 'flex h-12 items-center justify-center gap-2 rounded-xl border border-zinc-700 bg-zinc-900/60 px-4 text-sm font-bold text-zinc-200 transition hover:border-orange-400/60 hover:text-white disabled:opacity-40';
+
+const SLOT_COLOR: Record<OdinSlot, string> = {
+  BL: 'bg-sky-500/15 text-sky-300',
+  AP: 'bg-orange-500/15 text-orange-300',
+  CP: 'bg-violet-500/15 text-violet-300',
+  CSC: 'bg-emerald-500/15 text-emerald-300',
+  DATA: 'bg-pink-500/15 text-pink-300',
+};
+
+function Switch({ checked, onChange, disabled }: { checked: boolean; onChange: () => void; disabled?: boolean }) {
+  return (
+    <button type="button" role="switch" aria-checked={checked} onClick={onChange} disabled={disabled}
+      className={`relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:opacity-40 ${checked ? 'bg-orange-500' : 'bg-zinc-700'}`}>
+      <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-all ${checked ? 'left-[22px]' : 'left-0.5'}`} />
+    </button>
+  );
+}
+
+function Option({ checked, onChange, disabled, title, hint }: {
+  checked: boolean; onChange: () => void; disabled?: boolean; title: string; hint: string;
+}) {
+  return (
+    <div className="flex items-center gap-3 rounded-xl border border-zinc-800 bg-zinc-900/40 px-4 py-3">
+      <Switch checked={checked} onChange={onChange} disabled={disabled} />
+      <div className="min-w-0">
+        <p className="text-sm font-bold text-zinc-100">{title}</p>
+        <p className="text-xs text-zinc-500">{hint}</p>
+      </div>
+    </div>
+  );
+}
+
+const TONE = {
+  sky: 'border-sky-500/25 hover:border-sky-400/60 hover:bg-sky-500/10',
+  emerald: 'border-emerald-500/25 hover:border-emerald-400/60 hover:bg-emerald-500/10',
+  red: 'border-red-500/30 hover:border-red-400/70 hover:bg-red-500/10',
+} as const;
+
+function ActionButton({ onClick, disabled, icon, title, hint, tone }: {
+  onClick: () => void; disabled?: boolean; icon: string; title: string; hint: string; tone: keyof typeof TONE;
+}) {
+  return (
+    <button type="button" onClick={onClick} disabled={disabled}
+      className={`flex items-center gap-3 rounded-xl border bg-zinc-900/50 px-4 py-3 text-left transition disabled:cursor-not-allowed disabled:opacity-40 ${TONE[tone]}`}>
+      <span className="text-2xl">{icon}</span>
+      <span className="min-w-0">
+        <span className={`block text-sm font-bold ${tone === 'red' ? 'text-red-300' : 'text-zinc-100'}`}>{title}</span>
+        <span className="block text-xs text-zinc-500">{hint}</span>
+      </span>
+    </button>
   );
 }

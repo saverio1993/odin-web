@@ -44,6 +44,7 @@ export class OdinDevice {
   options: DeviceOptions;
 
   _devicePit?: PitData;
+  _devicePitRaw?: Uint8Array;
   _flashTimeout = 30_000;
   _flashSequence = 800;
   _flashPacketSize = 131072;
@@ -57,6 +58,8 @@ export class OdinDevice {
   }
 
   get pit() { return this._devicePit; }
+  /** El PIT tal como lo mandó el equipo (para guardarlo como .pit). */
+  get pitRaw() { return this._devicePitRaw; }
   get lz4Supported() { return this._lz4Supported; }
 
   private log(msg: string, type?: Parameters<OdinLogFn>[1]) { this.options.log(msg, type); }
@@ -217,6 +220,7 @@ export class OdinDevice {
 
     this.log(`✅ PIT leído: ${pitData.entries.length} particiones`, 'ok');
     this._devicePit = pitData;
+    this._devicePitRaw = fileData;
     return pitData;
   }
 
