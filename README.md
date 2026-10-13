@@ -1,98 +1,42 @@
 # Odin Web ⚡
 
-**Flasher de firmware para dispositivos Samsung (modo *Download*) directamente desde el navegador.**
-Implementa el protocolo **Odin** sobre **WebUSB** y **Web Serial**, por lo que funciona sin instalar Odin ni Heimdall — solo Chrome o Edge de escritorio.
+Flasher de firmware Samsung (modo *Download*) desde el navegador, por **Web Serial**. No hace falta instalar Odin, Heimdall ni Zadig: usa el puerto COM normal del driver de Samsung con Chrome o Edge de escritorio.
 
-> ⚠️ **Aviso:** flashear o borrar un dispositivo real es una operación destructiva y puede **brickear** el equipo o **borrar tus datos**. Úsalo bajo tu propia responsabilidad.
+> ⚠️ Flashear es una operación destructiva: un firmware equivocado puede dejar el equipo inutilizable y el CSC normal borra los datos. Úsalo bajo tu propia responsabilidad.
 
----
+## Qué lo hace distinto
 
-## ✨ Características
+El protocolo está **calcado de odin4** (v1.2.13, el que usa SamFwTool). Para replicarlo se capturó el USB con USBPcap durante un flasheo real que salió bien, y el código se ajustó hasta que una simulación con el firmware completo produjo **los mismos 1141 paquetes de control** que odin4. Los detalles están en [`docs/PROTOCOLO_odin4.md`](docs/PROTOCOLO_odin4.md).
 
-- 🔌 **Conexión por Serial (COM)** — usa el *Gadget Serial* de Samsung con el driver normal, **sin necesidad de Zadig/WinUSB**.
-- 🔌 **Conexión por WebUSB** — alternativa (requiere driver WinUSB).
-- 📦 **Carga de firmware estilo Odin** — slots **BL / AP / CP / CSC / USERDATA**.
-- 🗜️ **Descompresión LZ4** automática de las imágenes `.img.lz4`.
-- 📄 **Lectura de la PIT** y emparejamiento automático imagen → partición.
-- 🔎 **Analizar (dry-run)** — muestra qué imagen irá a cada partición **sin escribir nada**.
-- ⚡ **FLASH** multipartición en una sola sesión.
-- 🗑️ **Erase Userdata**, **Reboot**, **Download PIT** y más funciones manuales.
-- 🖥️ **Consola** integrada con logs legibles de cada operación.
+El flujo es el siguiente:
 
----
+1. `ODIN` → `LOKE`
+2. Inicio de sesión (`64/0`, versión 5), paquetes de 1 MiB (`64/5`) y tamaño total descomprimido (`64/2`).
+3. Escribe el PIT del CSC (`65/0`, `65/2`, datos, `65/3`) y después lee el PIT del equipo (`65/1`).
+4. Cada imagen se envía en tramos de 30 MiB: `66/0` → `66/2` → paquetes de 1 MiB → `66/3`. Los `.lz4` se descomprimen en el navegador, dentro de un Web Worker.
+5. Cierre con `67/0` y reinicio con `67/1`.
 
-## 🚀 Uso
+Probado en un **SM-A065M** con el firmware `A065MUBSECZG1` (bit 14).
 
-### Requisitos
-- **Chrome** o **Edge** de escritorio (WebUSB / Web Serial no existen en Firefox/Safari).
-- Un Samsung en **Download Mode** (apagar → mantener `Vol-` + `Vol+` y conectar el cable, o el combo de tu modelo).
+## Estructura
 
-### Arrancar la app
-```sh
-cd example
-npm install
-npm run dev
-```
-Abre **http://localhost:5173** en Chrome/Edge.
-
-### Flujo de flasheo
-1. **Conectar por Serial (COM)** → elige `SAMSUNG USB - Gadget Serial Control (COMx)`. Debe salir `✅ Handshake OK`.
-2. En **Cargar firmware**, selecciona tus archivos en los slots (`.tar` / `.tar.md5`):
-   - **BL** · Bootloader
-   - **AP** · System/PDA
-   - **CP** · Modem
-   - **CSC** · Región (borra datos) / **HOME_CSC** (conserva datos)
-   - **USERDATA** · opcional ⚠️ (borra datos)
-3. Pulsa **🔎 Analizar (dry-run)** y revisa que cada imagen mapee a su partición correcta.
-4. Pulsa **⚡ FLASH** y confirma. Marca **Reboot al terminar** si quieres que arranque solo.
-
-> 💡 Empieza probando una partición pequeña (p. ej. `boot` o `recovery`) antes de un AP completo. El `super.img` descomprimido puede ser de varios GB y llegar al límite de memoria del navegador.
-
----
-
-## 🧩 Cómo funciona
-
-```
-.tar / .tar.md5  ─▶  parseo TAR  ─▶  .img.lz4  ─▶  descompresión LZ4  ─▶  .img
-                                                                           │
-   PIT del dispositivo ──▶ empareja por flashFilename ──▶ partición ◀──────┘
-                                                                           │
-                                          sesión Odin: setFlashTotalSize + sendFile
-```
-
-- **Transporte Serial:** un adaptador imita la interfaz USB (`transferOut`/`transferIn`) pero lee/escribe por el puerto COM. Handshake de 4 bytes (`ODIN` → `LOKE`), señal **DTR** activada, sin *empty transfers*.
-- **Núcleo del protocolo:** basado en [libmjolnir](https://github.com/r3pwn/libmjolnir) (PIT, handshake, sesión, flash, erase).
-
----
-
-## 📁 Estructura
-
-| Ruta | Descripción |
+| Ruta | Contenido |
 |---|---|
-| `src/` | Librería del protocolo Odin (libmjolnir) |
-| `example/src/App.vue` | Interfaz del flasher (Vue 3) |
-| `example/src/odin-flash.ts` | TAR + LZ4 + flasheo por PIT |
-| `example/src/serial-odin.ts` | Transporte Web Serial (puerto COM) |
+| `lib/odin/` | Protocolo: `device.ts` (orquestación), `packets.ts`, `pit.ts`, `transport.ts` (Web Serial), `lz4.ts`, `md5.ts` |
+| `lib/odin-firmware-set.ts` | Detecta el set BL/AP/CP/CSC en una carpeta y lee los `.tar` |
+| `components/odin-flash-tool.tsx` | Componente React/Next.js de la herramienta |
+| `public/odin-lz4-worker.js` | Worker que descomprime los LZ4 (va como archivo estático) |
+| `docs/PROTOCOLO_odin4.md` | El protocolo capturado de odin4, paquete por paquete |
+| `tools/` | Scripts para capturar el USB de odin4 con USBPcap (Windows) |
 
----
+Está pensado para usarse dentro de una app Next.js con el alias `@/` apuntando a la raíz, igual que en academia-jrubio.com/herramientas.
 
-## ⚠️ Descargo de responsabilidad
+## Requisitos
 
-Esta herramienta se ofrece **tal cual**, sin garantía de ningún tipo. El flasheo de firmware puede dañar permanentemente tu dispositivo, anular la garantía o provocar pérdida de datos. **El autor no se hace responsable** de ningún daño. Haz copias de seguridad y asegúrate de usar el firmware correcto para tu modelo exacto.
+- Chrome o Edge de escritorio (Web Serial no existe en Firefox ni Safari).
+- Driver USB de Samsung instalado.
+- El teléfono en modo Download, **sin MDM**, y con un firmware de bit **igual o mayor** al que tiene el equipo.
 
----
+## Licencia
 
-## 📜 Licencia y créditos
-
-- Licencia **MIT** (ver [`LICENSE`](LICENSE)).
-- Núcleo del protocolo Odin basado en **[libmjolnir](https://github.com/r3pwn/libmjolnir)** de Greg Willard (r3pwn).
-
----
-
-<div align="center">
-
-### ✍️ Desarrollado por **saverio1993**
-
-🔗 [github.com/saverio1993](https://github.com/saverio1993)
-
-</div>
+MIT. Es un port de [libmjolnir](https://github.com/lineageos-infra/libmjolnir) (Copyright © 2023 Greg Willard), con el flujo ajustado a odin4.
