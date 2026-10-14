@@ -26,7 +26,16 @@ function timeoutPromise<T>(promise: Promise<T>, reason: string, ms: number): Pro
 }
 
 const BAUD_RATE = 115200;
-const READ_BUFFER_SIZE = 4096;
+// El equipo trata CADA envío USB como un paquete: si un write() sale partido,
+// toma cada trozo como un paquete aparte y los datos quedan corridos (PIT
+// rechazado con ffffffff en 65/3, o uh.bin rechazado con fffffffb al cerrar
+// la secuencia). Chrome escribe a través de un buffer circular de
+// `bufferSize` bytes y corta el write() donde el buffer da la vuelta
+// (captura web A165M: 992876 + 55700 en vez de 1 MiB). Por eso send() lleva
+// la cuenta de la posición y, antes de un write() que cruzaría el final,
+// abre un writable nuevo (buffer vacío, posición 0). Así cada paquete sale
+// en un solo bulk, igual que odin4.
+const SERIAL_BUFFER_SIZE = 8 * 1048576;
 
 export class WebSerialTransport implements OdinTransport {
   readonly port: SerialPort;
@@ -39,6 +48,8 @@ export class WebSerialTransport implements OdinTransport {
   private _available = 0;
 
   private _pendingRead: Promise<ReadableStreamReadResult<Uint8Array>> | undefined;
+  /** Bytes escritos en el buffer circular del writable actual. */
+  private _writePos = 0;
 
   constructor(port: SerialPort) {
     this.port = port;
@@ -46,7 +57,7 @@ export class WebSerialTransport implements OdinTransport {
 
   async connect(timeout: number) {
     await timeoutPromise(
-      this.port.open({ baudRate: BAUD_RATE, bufferSize: READ_BUFFER_SIZE }),
+      this.port.open({ baudRate: BAUD_RATE, bufferSize: SERIAL_BUFFER_SIZE }),
       '[connect] unable to open serial port',
       timeout,
     );
@@ -63,11 +74,30 @@ export class WebSerialTransport implements OdinTransport {
 
     this._reader = this.port.readable.getReader();
     this._writer = this.port.writable.getWriter();
+    this._writePos = 0;
   }
 
   async send(data: Uint8Array, timeout: number) {
     if (!this._writer) throw new Error('serial port is not open');
+    if (data.length === 0) return; // odin4 no manda envíos vacíos
+    if (this._writePos + data.length > SERIAL_BUFFER_SIZE) await this._freshWriter(timeout);
     await timeoutPromise(this._writer.write(data), '[device] unable to send packet', timeout);
+    this._writePos += data.length;
+  }
+
+  /** Cierra el writable (espera a que se envíe todo) y abre otro con el buffer vacío. */
+  private async _freshWriter(timeout: number) {
+    const old = this.port.writable;
+    await timeoutPromise(this._writer!.close(), '[device] unable to flush serial writer', timeout);
+    this._writer!.releaseLock();
+    let writable = this.port.writable;
+    for (let i = 0; i < 50 && (!writable || writable === old); i++) {
+      await new Promise((r) => setTimeout(r, 10));
+      writable = this.port.writable;
+    }
+    if (!writable || writable === old) throw new Error('serial port did not expose a new writable stream');
+    this._writer = writable.getWriter();
+    this._writePos = 0;
   }
 
   async receive(length: number, timeout: number): Promise<Uint8Array> {
